@@ -10,15 +10,16 @@ import pandas as pd
 import concurrent.futures
 from Bio.SeqUtils import seq1
 
-from zipfile import ZipFile
-from rossmann_toolbox.utils import sharpen_preds, corr_seq, custom_warning
-from rossmann_toolbox.utils import SeqVec
-from rossmann_toolbox.utils.encoders import SeqVecMemEncoder
-from rossmann_toolbox.utils.generators import SeqChunker
+from transformers import logging
+logging.set_verbosity_warning()
+
+from rossmann_toolbox.utils import postprocess_crf, corr_seq, custom_warning
+from rossmann_toolbox.utils import ProtT5
+from rossmann_toolbox.utils.data import Dataset, collate
 from rossmann_toolbox.models import SeqCoreEvaluator, SeqCoreDetector
 from conditional import conditional
 from captum.attr import IntegratedGradients
-
+from torch.utils.data import DataLoader
 from rossmann_toolbox.utils import MyFoldX, fix_TER, solveX
 from rossmann_toolbox.utils import separate_beta_helix
 from rossmann_toolbox.utils.tools import run_command, extract_core_dssp
@@ -30,6 +31,7 @@ warnings.showwarning = custom_warning
 
 class RossmannToolbox:
 	struct_utils = None
+
 	def __init__(self, n_cpu = -1, use_gpu=True, foldx_loc=None, hhsearch_loc=None, dssp_loc=None):
 		"""
 		Rossmann Toolbox - A framework for predicting and engineering the cofactor specificity of Rossmann-fold proteins
@@ -55,7 +57,7 @@ class RossmannToolbox:
 				warnings.warn('No GPU detected, falling back to the CPU version!')
 
 		self._path = os.path.dirname(os.path.abspath(__file__))
-		self._seqvec = self._setup_seqvec()
+		self._embedder = self._setup_embedder()
 		self._weights_prefix = f'{self._path}/weights/'
 		self._foldx_loc = foldx_loc
 		if self._foldx_loc is not None:
@@ -192,25 +194,13 @@ class RossmannToolbox:
 
 		return data
 
-	def _setup_seqvec(self):
+	def _setup_embedder(self):
 		"""
-		Load SeqVec model to either GPU or CPU, if weights are not cached - download them from the mirror.
-		:return: instance of SeqVec embedder
+		Load ProtT5 model to either GPU or CPU, if weights are not cached - download them from the mirror.
+		:return: instance of the ProtT5 embedder
 		"""
-		seqvec_dir = f'{self._path}/weights/seqvec'
-		seqvec_conf_fn = f'{seqvec_dir}/uniref50_v2/options.json'
-		seqvec_weights_fn = f'{seqvec_dir}/uniref50_v2/weights.hdf5'
-		if not (os.path.isfile(seqvec_conf_fn) and os.path.isfile(seqvec_weights_fn)):
-			print('SeqVec weights are not available, downloading from the remote source (this\'ll happen only once)...')
-			torch.hub.download_url_to_file('https://rostlab.org/~deepppi/seqvec.zip',
-										   f'{self._path}/weights/seqvec.zip')
-			archive = ZipFile(f'{self._path}/weights/seqvec.zip')
-			archive.extract('uniref50_v2/options.json', seqvec_dir)
-			archive.extract('uniref50_v2/weights.hdf5', seqvec_dir)
-		if self.use_gpu:
-			return SeqVec(model_dir=f'{seqvec_dir}/uniref50_v2', cuda_device=0, tokens_per_batch=8000)
-		else:
-			return SeqVec(model_dir=f'{seqvec_dir}/uniref50_v2', cuda_device=-1, tokens_per_batch=8000)
+		cuda_device = 0 if self.use_gpu else -1
+		return ProtT5(cuda_device=cuda_device, tokens_per_batch=10000)
 	
 	def _setup_dl3d(self):
 		"""
@@ -251,27 +241,26 @@ class RossmannToolbox:
 		return SeqCoreDetector().to(self.device)
 
 	def _run_seq_core_detector(self, data):
-		embeddings = self._seqvec.encode(data, to_file=False)
-		seqvec_enc = SeqVecMemEncoder(embeddings, pad_length=500)
-		gen = SeqChunker(data, batch_size=64, W_size=500, shuffle=False,
-						 data_encoders=[seqvec_enc], data_cols=['sequence'])
+		embs_dict = self._embedder.encode(data)
+		dataset = Dataset(data_dict=data['sequence'].to_dict(), embs_dict=embs_dict)
+		loader = DataLoader(dataset, 128, shuffle=False, collate_fn=collate(), pin_memory=True)
+
 		model = self._setup_seq_core_detector()
 		model.load_state_dict(torch.load(f'{self._weights_prefix}/coredetector.pt'))
 		model = model.eval()
-		preds = []
+		tmp_states, tmp_probs = [], []
 
-		# Predict core locations
+		# Predict core locations with CRF model
 		with torch.no_grad():
-			for batch in gen:
-				batch = torch.tensor(batch[0].astype(dtype=np.float32), device=self.device)
-				batch_preds = model(batch)
-				preds.append(batch_preds.cpu().detach().numpy())
+			for embs, mask, seq_lengths in loader:
+				embs, mask = embs.to(self.device), mask.to(self.device)
+				b_states, b_probs = model.predict(embs, mask)
+				for e_states, e_probs in zip(b_states, b_probs.detach().cpu().numpy()):
+					tmp_states.append(e_states)
+					tmp_probs.append(e_probs[:, 1])
 
-		# Post-process predictions
-		preds = np.vstack(preds)
-		preds_depadded = {key: np.concatenate([preds[ix][ind[0]:ind[1]] for ix, ind in zip(*value)]) for key, value
-						  in gen.indices.items()}
-		return {key: (sharpen_preds(value), value) for key, value in preds_depadded.items()}
+		return {key: (postprocess_crf(states, probs), probs) for key, states, probs in
+				zip(data.index, tmp_states, tmp_probs)}
 
 	def _setup_seq_core_evaluator(self):
 		return SeqCoreEvaluator().to(self.device)
@@ -311,12 +300,11 @@ class RossmannToolbox:
 		preds_ens = []
 		attrs_ens = []
 		# Encode with SeqVec
-		embeddings = self._seqvec.encode(data, to_file=False)
+		embs_dict = self._embedder.encode(data)
+		dataset = Dataset(data_dict=data['sequence'].to_dict(), embs_dict=embs_dict)
+		loader = DataLoader(dataset, 1, shuffle=False, collate_fn=collate(), pin_memory=True)
 
 		# Setup generator that'll be evaluated
-		seqvec_enc = SeqVecMemEncoder(embeddings, pad_length=65)
-		gen = SeqChunker(data, batch_size=64, W_size=65, shuffle=False,
-						 data_encoders=[seqvec_enc], data_cols=['sequence'])
 
 		# Predict with each of N predictors, depad predictions and average out for final output
 		model = self._setup_seq_core_evaluator()
@@ -327,18 +315,20 @@ class RossmannToolbox:
 			attrs = []
 			with conditional(not importance, torch.no_grad()):
 				# Raw predictions
-				for batch in gen:
-					batch = torch.tensor(batch[0].transpose(0, 2, 1).astype(dtype=np.float32), device=self.device)
-					batch_preds = model(batch)
+				for embs, mask, seq_lengths in loader:
+					embs, mask = embs.permute(0, 2, 1).to(self.device), mask.to(self.device)
+					batch_preds = model.predict(embs, mask=mask, sequence_lengths=seq_lengths)
 					preds.append(batch_preds.cpu().detach().numpy())
 					if importance:
+						pass
+						"""
 						ig = IntegratedGradients(model)
 						baseline = torch.full_like(batch, 0, device=self.device)
 						batch_attrs = np.asarray(
 							[ig.attribute(batch, baseline, i).sum(axis=1).clip(min=0).cpu().detach().numpy() for i in
 							 range(0, self.n_classes)])
 						attrs.append(batch_attrs.transpose(1, 0, 2))
-
+						"""
 			preds_ens.append(np.vstack(preds))
 			if importance:
 				attrs_ens.append(np.vstack(attrs))
@@ -353,11 +343,12 @@ class RossmannToolbox:
 		if importance:
 			avgs = attrs_ens.mean(axis=0)
 			stds = attrs_ens.std(axis=0)
-			attrs = {key: {f'{self.rev_label_dict[j]}':
+			attrs = {}
+			"""attrs = {key: {f'{self.rev_label_dict[j]}':
 							   ((np.concatenate([avgs[ix, j, ind[0]:ind[1]] for ix, ind in zip(*value)]),
 								 np.concatenate([stds[ix, j, ind[0]:ind[1]] for ix, ind in zip(*value)]))
 							   ) for j in range(0, self.n_classes)}
-					 for key, value in gen.indices.items()}
+					 for key, value in gen.indices.items()}"""
 			return results, attrs
 		return results
 
@@ -630,10 +621,3 @@ class StructPrep:
 			if os.path.getsize(path_file_full) > 0:
 				condition = True
 		return condition
-    
-
-	
-
-	
-	
-	

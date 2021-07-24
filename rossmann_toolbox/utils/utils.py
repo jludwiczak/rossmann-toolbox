@@ -1,55 +1,17 @@
-from collections.abc import Iterable
-
 import numpy as np
-import warnings
 from scipy.signal import find_peaks
-from itertools import groupby
 
 
 def custom_warning(message, category, filename, lineno, file=None, line=None):
     print(f'{filename}:{lineno} - {message}')
 
-def sharpen_preds(probs, sep=15, min_prob=0.5):
-    """
-    Sharpens raw probabilities to more human-readable format
-    :param probs: raw probabilities
-    :return: sharpened probabilities
-    """
-    probs = probs.flatten()
-    above_threshold = probs > min_prob
-    peak_dict = {}
-    i = 0
-    for k, g in groupby(enumerate(above_threshold), key=lambda x: x[1]):
-        if k:
-            g = list(g)
-            beg, end = g[0][0], g[-1][0]
-            if end -beg >= 1:
-                peak_dict[i] = (beg, end, max(probs[beg:end]))
-                i += 1
-    if len(peak_dict) == 1:
-        merged_peaks = [list(peak_dict.keys())]
-    else:
-        merged_peaks = []
-        i = 0
-        while i <= len(peak_dict) -1:
-            merge_list = [i]
-            while True:
-                if peak_dict[i + 1][0] - peak_dict[i][1] <= sep:
-                    merge_list.append(i + 1)
-                    i += 1
-                    if i == len(peak_dict) - 1:
-                        merged_peaks.append(merge_list)
-                        break
-                else:
-                    merged_peaks.append(merge_list)
-                    i += 1
-                    break
-            if i == len(peak_dict) - 1:
-                break
 
-    merged_peak_dict = {i: (peak_dict[mp[0]][0], peak_dict[mp[-1]][1], max([peak_dict[idx][2] for idx in mp]))
-                        for i, mp in enumerate(merged_peaks)}
-    return merged_peak_dict
+def postprocess_crf(tags, probs):
+    _, peaks = find_peaks(tags, width=30)
+    peak_dict = {i: (beg, end, np.max(probs[beg:end])) for i, (beg, end) in
+                 enumerate(zip(peaks['left_bases'], peaks['right_bases']))}
+    return peak_dict
+
 
 def corr_seq(seq):
     """

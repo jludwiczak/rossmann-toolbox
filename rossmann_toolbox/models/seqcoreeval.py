@@ -2,25 +2,55 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class SeqCoreEvaluator(nn.Module):
-    def __init__(self):
+    def __init__(self, embeddings_dim=1024, output_dim=4, dropout=0.25, kernel_size=7, conv_dropout: float = 0.25):
         super(SeqCoreEvaluator, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels=1024, out_channels=32, kernel_size=7)
-        self.conv2 = nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5)
-        self.dr1 = nn.Dropout(p=0.5)
-        self.bc1 = nn.BatchNorm1d(32, eps=1e-03, momentum=0.99)
-        self.lin1 = nn.Linear(32, 32)
-        self.lin2 = nn.Linear(61, 64)
-        self.dr2 = nn.Dropout(p=0.25)
-        self.lin2 = nn.Linear(32, 16)
-        self.lin3 = nn.Linear(16, 4)
 
-    def forward(self, x):
-        x = self.dr1(F.relu(self.conv1(x)))
-        x = self.bc1(x)
-        x = self.dr2(F.relu(self.conv2(x)))
-        x = F.relu(self.lin1(x.transpose(2, 1)))
-        x = torch.max(x, axis=1).values
-        x = torch.sigmoid(self.lin3(F.relu(self.lin2(x))))
-        return x
+        self.feature_convolution = nn.Conv1d(embeddings_dim, embeddings_dim, kernel_size, stride=1,
+                                             padding=kernel_size // 2)
+        self.attention_convolution = nn.Conv1d(embeddings_dim, embeddings_dim, kernel_size, stride=1,
+                                               padding=kernel_size // 2)
 
+        self.softmax = nn.Softmax(dim=-1)
+
+        self.dropout = nn.Dropout(conv_dropout)
+
+        self.linear = nn.Sequential(
+            nn.Linear(2 * embeddings_dim, 32),
+            nn.Dropout(dropout),
+            nn.ReLU(),
+            nn.BatchNorm1d(32)
+        )
+
+        self.output = nn.Linear(32, output_dim)
+
+    def forward(self, x: torch.Tensor, mask, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            x: [batch_size, embeddings_dim, sequence_length] embedding tensor that should be classified
+            mask: [batch_size, sequence_length] mask corresponding to the zero padding used for the shorter sequecnes in the batch. All values corresponding to padding are False and the rest is True.
+        Returns:
+            classification: [batch_size,output_dim] tensor with logits
+        """
+        o = self.feature_convolution(x)  # [batch_size, embeddings_dim, sequence_length]
+        o = self.dropout(o)  # [batch_gsize, embeddings_dim, sequence_length]
+        attention = self.attention_convolution(x)  # [batch_size, embeddings_dim, sequence_length]
+
+        # mask out the padding to which we do not want to pay any attention (we have the padding because the sequences have different lenghts).
+        # This padding is added by the dataloader when using the padded_permuted_collate function in utils/general.py
+        attention = attention.masked_fill(mask[:, None, :] == False, -1e9)
+
+        # code used for extracting embeddings for UMAP visualizations
+        # extraction =  torch.sum(x * self.softmax(attention), dim=-1)
+        # extraction = self.id0(extraction)
+
+        o1 = torch.sum(o * self.softmax(attention), dim=-1)  # [batchsize, embeddings_dim]
+        o2, _ = torch.max(o, dim=-1)  # [batchsize, embeddings_dim]
+        o = torch.cat([o1, o2], dim=-1)  # [batchsize, 2*embeddings_dim]
+        o = self.linear(o)  # [batchsize, 32]
+        return self.output(o)  # [batchsize, output_dim]
+
+    def predict(self, x: torch.Tensor, mask, **kwargs) -> torch.Tensor:
+        x = self.forward(x, mask)
+        return F.softmax(x, dim=-1)
