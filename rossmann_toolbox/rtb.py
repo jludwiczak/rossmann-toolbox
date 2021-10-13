@@ -259,7 +259,7 @@ class RossmannToolbox:
 					tmp_states.append(e_states)
 					tmp_probs.append(e_probs[:, 1])
 
-		return {key: (postprocess_crf(states, probs), probs) for key, states, probs in
+		return {key: (postprocess_crf(probs), probs) for key, states, probs in
 				zip(data.index, tmp_states, tmp_probs)}
 
 	def _setup_seq_core_evaluator(self):
